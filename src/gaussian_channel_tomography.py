@@ -1,11 +1,7 @@
 import numpy as np
-import jax.numpy as jnp
-from jax import vmap
-from jax import jit
-import jax.scipy as jsp
-from jax.scipy.special import factorial
-from jax.scipy.stats import multivariate_normal
-import time
+import scipy as sp
+from numba import njit
+from scipy.special import factorial
 import matplotlib.pyplot as plt
 
 class CVQKDChannelTomography():
@@ -26,10 +22,9 @@ class CVQKDChannelTomography():
         self.process_tensor_shape = (cutoff, cutoff, cutoff, cutoff)
 
         # Generate m, n, j, k meshgrid for the process tensor. Store as jnp.uint8 to save memory. Note this limits cutoff to 255.
-        self.m_mesh, self.n_mesh, self.j_mesh, self.k_mesh = jnp.meshgrid(jnp.arange(cutoff), jnp.arange(cutoff), jnp.arange(cutoff), jnp.arange(cutoff))
+        self.m_mesh, self.n_mesh, self.j_mesh, self.k_mesh = np.meshgrid(np.arange(cutoff), np.arange(cutoff), np.arange(cutoff), np.arange(cutoff))
         
-    # @jit
-    def generate_pure_loss_process_tensor(self, loss: float) -> jnp.ndarray:
+    def generate_pure_loss_process_tensor(self, loss: float) -> np.ndarray:
         """
             Generates a process tensor for a pure loss channel.
 
@@ -47,52 +42,44 @@ class CVQKDChannelTomography():
 
         eta = 1.0 - loss # Represents the transmissivity of the channel: \rho = \ket{\eta \alpha} \bra{\eta \alpha}
 
-        # @jit
         def process_tensor_element(m, n, j, k, eta):
-            delta = ((m - j) == (n - k))
+            # Check delta condition
+            delta_condition = (m - j) == (n - k)
+            
+            # Check denominator condition. (Physically relevant, can't have negative photons)
+            denominator_condition = (m - j) >= 0
 
-            m_fac = factorial(m)
-            n_fac = factorial(n)
-            j_fac = factorial(j)
-            k_fac = factorial(k)
-            m_minus_j_fac = factorial(m - j)
+            valid_indices = np.where(delta_condition & denominator_condition)
 
-            return (
-                delta
-                * jnp.sqrt(m_fac * n_fac / (j_fac * k_fac))
-                * (eta ** (j + k))
-                * ((1 - eta ** 2) ** (m - j))
+            m_fac = factorial(m[valid_indices])
+            n_fac = factorial(n[valid_indices])
+            j_fac = factorial(j[valid_indices])
+            k_fac = factorial(k[valid_indices])
+            m_minus_j_fac = factorial(m[valid_indices] - j[valid_indices])
+
+            result = np.zeros_like(m, dtype=float)
+            result[valid_indices] = (
+                np.sqrt(m_fac * n_fac / (j_fac * k_fac))
+                * (eta ** (j[valid_indices] + k[valid_indices]))
+                * ((1 - eta ** 2) ** (m[valid_indices] - j[valid_indices]))
                 / m_minus_j_fac
             )
+            return result
+    
+        m, n, j, k = np.meshgrid(
+            np.arange(self.cutoff),
+            np.arange(self.cutoff),
+            np.arange(self.cutoff),
+            np.arange(self.cutoff),
+            indexing='ij'
+        )
 
-        # # Vectorize the function over all indices
-        # vectorized_epsilon = vmap(
-        #     vmap(
-        #         vmap(
-        #             vmap(process_tensor_element, in_axes=(0, 0, 0, 0, None)),  # Batch over m
-        #             in_axes=(0, 0, 0, 0, None)                                 # Batch over n
-        #         ),
-        #         in_axes=(0, 0, 0, 0, None)                                     # Batch over j
-        #     ),
-        #     in_axes=(0, 0, 0, 0, None)                                         # Batch over k
-        # )
-
-        # # Compute the process tensor
-        # process_tensor = vectorized_epsilon(self.m_mesh, self.n_mesh, self.j_mesh, self.k_mesh, eta)
-        # Initialize the process tensor with zeros
-        process_tensor = np.zeros(self.process_tensor_shape)
-
-        # Compute the process tensor using nested for loops
-        for m in range(self.cutoff):
-            for n in range(self.cutoff):
-                for j in range(self.cutoff):
-                    for k in range(self.cutoff):
-                        process_tensor[m, n, j, k] = process_tensor_element(m, n, j, k, eta)
+        process_tensor = process_tensor_element(m, n, j, k, eta)
 
         return process_tensor
 
 if __name__ == "__main__":
-    cutoff = 6
+    cutoff = 100
     ct = CVQKDChannelTomography(cutoff)
     process_tensor = ct.generate_pure_loss_process_tensor(0.5)
 
@@ -104,12 +91,12 @@ if __name__ == "__main__":
     diagonal_elements = np.einsum('kkmm->km', process_tensor)
 
     # Plot the diagonal elements.
-    # plt.imshow(diagonal_elements)
-    # plt.xlabel("m")
-    # plt.ylabel("k")
-    # plt.title("$\epsilon_{mm}^{kk}$")
-    # plt.colorbar()
-    # plt.show()
+    plt.imshow(diagonal_elements)
+    plt.xlabel("m")
+    plt.ylabel("k")
+    plt.title("$\epsilon_{mm}^{kk}$")
+    plt.colorbar()
+    plt.show()
 
-    np.set_printoptions(precision=2, suppress=False)
-    print(diagonal_elements)
+    # np.set_printoptions(precision=2, suppress=False)
+    # print(diagonal_elements)
