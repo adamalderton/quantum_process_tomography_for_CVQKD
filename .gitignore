@@ -1,5 +1,7 @@
 # Project specific
 src/data_dir.py
+temp.py
+**.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
