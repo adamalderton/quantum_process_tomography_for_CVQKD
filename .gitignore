@@ -2,6 +2,7 @@
 src/data_dir.py
 temp.py
 **.ipynb
+data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -3,8 +3,9 @@ import scipy as sp
 from numba import njit
 from scipy.special import factorial
 import matplotlib.pyplot as plt
+import os
 
-class CVQKDChannelTomography():
+class CVQKDChannelTomographySynthetic():
     """
         CVQKD channel tomography class
     """
@@ -78,25 +79,30 @@ class CVQKDChannelTomography():
 
         return process_tensor
 
+    def load_pure_loss_data(self, filename, data_dir):
+        # Load the process tensor from data_dir + filename produced by the synthetic notebook
+        full_path = os.path.join(data_dir, filename)
+        process_tensor = np.load(full_path)
+        return process_tensor
+
 if __name__ == "__main__":
     cutoff = 100
-    ct = CVQKDChannelTomography(cutoff)
-    process_tensor = ct.generate_pure_loss_process_tensor(0.5)
-
-    print(process_tensor.shape)
-
-    # Given \Epsilon_{jk}^{mn}, find the 'diagonal' elements \Epsilon_{kk}^{mm}
-    # This is the probability of the channel outputting k photons given m input photons.
     
-    diagonal_elements = np.einsum('kkmm->km', process_tensor)
+    # ct = CVQKDChannelTomographySynthetic(cutoff)
+    # theoretical_process_tensor = ct.generate_pure_loss_process_tensor(0.5)
 
-    # Plot the diagonal elements.
-    plt.imshow(diagonal_elements)
-    plt.xlabel("m")
-    plt.ylabel("k")
-    plt.title("$\epsilon_{mm}^{kk}$")
-    plt.colorbar()
-    plt.show()
+    # # Given \Epsilon_{jk}^{mn}, find the 'diagonal' elements \Epsilon_{kk}^{mm}
+    # # This is the probability of the channel outputting k photons given m input photons.
+    
+    # theoretical_diagonal_elements = np.einsum('kkmm->km', theoretical_process_tensor)
 
-    # np.set_printoptions(precision=2, suppress=False)
-    # print(diagonal_elements)
+    # data_dir = data_dir.split("\\")[:-2]
+    # data_dir = "\\".join(data_dir) + "\\"
+    # filename = "synthetic_data_20km_loss.csv"
+    # synthetic_data = ct.load_pure_loss_data(filename, data_dir, allow_pickle=True)
+
+    # # Show column headings of synthetic data
+    # print(synthetic_data[0])
+
+
+
