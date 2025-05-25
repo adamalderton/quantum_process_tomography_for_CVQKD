@@ -4,6 +4,8 @@ import pandas as pd
 from numpy.polynomial.laguerre import laggauss
 from scipy.special import eval_hermite, factorial, gammaln
 from rich.console import Console
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm  
 
 console = Console()
 
@@ -209,13 +211,131 @@ def extract_valid_probe_states(alice_x: np.ndarray, alice_p: np.ndarray, bob_x: 
 
     return df_filt
 
+def _histogram_Q(
+    bob_x: np.ndarray,
+    bob_p: np.ndarray,
+    u_mesh: np.ndarray,          # (R,)
+    phi_mesh: np.ndarray         # (P,)
+) -> np.ndarray:
+    """
+    Build the discretised Q-function  Q[r_m, phi_n]  on the (u,phi) quadrature
+    mesh by simple binning.  The output has shape (R, P) and integrates to 1.
+    """
+    # polar coordinates for every shot
+    r   = np.sqrt(bob_x**2 + bob_p**2)
+    phi = np.mod(np.arctan2(bob_p, bob_x), 2*np.pi)
+
+    # the theory uses  u = 2 r^2   (Laguerre quadrature variable)
+    u = 2.0 * r**2
+
+    # turn the mesh points into bin edges once
+    u_edges   = np.concatenate([[0.0], 0.5*(u_mesh[1:] + u_mesh[:-1]), [np.inf]])
+    phi_edges = np.concatenate([[0.0], phi_mesh + (phi_mesh[1]-phi_mesh[0]), [2*np.pi]])
+
+    hist, _, _ = np.histogram2d(u, phi, bins=[u_edges, phi_edges])   # (R, P)
+    return hist / hist.sum()                                            # normalise
+
+def _angular_fft(Q: np.ndarray, k_max: int) -> np.ndarray:
+    """
+    Return  Q_k[u_m, k]  for  k = 0..k_max  (shape: (k_max+1, R)).
+    """
+    # FFT over the *second* axis (phi index).  Divide by P for an orthonormal DFT.
+    Qk_full = np.fft.fft(Q, axis=1) / Q.shape[1]                  # (R, P)
+    return np.ascontiguousarray(Qk_full[:, :k_max+1].T)           # (k_max+1, R)
+
+def _radial_contraction(Qk: np.ndarray,
+                        H_hermite: np.ndarray,
+                        w_GL: np.ndarray,
+                        pref_rho: np.ndarray,
+                        N: int) -> np.ndarray:
+    """
+    Compute rho[m,n] for a single probe from its Q_k radial slices.
+
+    Parameters
+    ----------
+    Qk         : (N+1, R)  – FFT slices for k = 0…N  (positive k only)
+    H_hermite  : (2N+1, R) – H_{ℓ}(u_m/2) for ℓ = 0…2N
+    w_GL       : (R,)      – Gauss–Laguerre weights
+    pref_rho   : (N+1,N+1) – ε_{mn} √m!√n! / (2 (m+n)!)
+    N          : int       – Fock cutoff
+    """
+    k_max = N                               # range we really need
+    # ------------------------------------------------------------
+    # Step 1 : radial integrals  I[ℓ]  for ℓ = 0…2N,
+    #          where ℓ = m+n and k = n-m = ℓ - 2m
+    # ------------------------------------------------------------
+    I = np.zeros((2*N+1,), dtype=np.complex128)
+
+    for k in range(-k_max, k_max+1):        # k = -N…+N
+        # pick the stored slice: Qk_pos = Qk[|k|]
+        Qk_pos = Qk[abs(k)]
+        if k < 0:                           # negative k comes from complex-conjugate
+            Q_slice = np.conj(Qk_pos)
+        else:
+            Q_slice = Qk_pos
+
+        # matching Hermite row index is   ℓ = k + N + m   but we don't yet know m.
+        # The easy trick: H_{ℓ}(u) only depends on ℓ, so integrate for *all* ℓ at once
+        # by dotting the whole (2N+1,R) table with w_GL weighed slice.
+        #
+        # But because each k uses a *single* ℓ = n-m shift, the cheaper way is:
+        ell = k + N              # shift range -N…N → 0…2N
+        if 0 <= ell <= 2*N:
+            I[ell] = np.dot(w_GL, Q_slice * H_hermite[ell])
+
+    # ------------------------------------------------------------
+    # Step 2 : map (m,n) to k = n-m and ℓ = m+n and multiply prefactor
+    # ------------------------------------------------------------
+    rho = np.empty((N+1, N+1), dtype=np.complex128)
+    for m in range(N+1):
+        for n in range(N+1):
+            k = n - m                          # -N … +N
+            ell = m + n                        # 0 … 2N
+            rho[m, n] = pref_rho[m, n] * I[ell]
+
+    return rho
+
+def process_single_probe(idx: int,
+                         alpha: complex,
+                         df: pd.DataFrame,
+                         bob_cols=("bob_x", "bob_p"),
+                         *,
+                         u_mesh, phi_mesh, w_GL,
+                         H_hermite, pref_rho, N) -> tuple[int, np.ndarray]:
+    """
+    Worker function — runs in a separate process when we parallelise.
+
+    Returns
+    -------
+    idx          : the probe index (so the caller can re-insert in order)
+    rho_i        : (N+1, N+1) complex ndarray for this probe
+    """
+    # 1) slice the dataframe very cheaply
+    mask = (df["alice_x"].values == alpha.real) & (df["alice_p"].values == alpha.imag)
+    grp  = df.loc[mask, list(bob_cols)]
+
+    # 2) build Q(u_m, phi_n)
+    Q = _histogram_Q(grp["bob_x"].to_numpy(),
+                     grp["bob_p"].to_numpy(),
+                     u_mesh,
+                     phi_mesh)                                    # (R, P)
+
+    # 3) angular FFT (only need k = 0 … N+1)
+    Qk = _angular_fft(Q, k_max=N+1)                               # (k_max+1, R)
+
+    # 4) radial contraction → rho_{mn}
+    rho_i = _radial_contraction(Qk, H_hermite, w_GL, pref_rho, N)
+
+    # 5) return the index and the computed density matrix. idx is needed for multiprocessing.
+    return idx, rho_i
+
 def main():
     console.log("### Starting...")
     # Parameters
-    A = 1000  # Number of probe states
-    R = 128   # Radial grid size
-    P = 128   # Angular grid size
-    N = 100   # Fock cutoff
+    plot = False # Set to False to disable plotting
+    R = 80   # Radial grid size
+    P = 80   # Angular grid size
+    N = 35  # Fock cutoff
     d = 5     # Maximum polynomial degree
     probe_state_instance_minimum = 1000 # The minimum number of data points for each probe state (x_in, p_in)
 
@@ -239,16 +359,42 @@ def main():
     # more neatly later.
     probe_states = (df["alice_x"] + 1j * df["alice_p"]).drop_duplicates().to_numpy()
 
+    if plot:
+        console.log("### Plotting probe states...")
+        probe_counts = (
+            df.groupby(['alice_x', 'alice_p'])
+            .size()                                   # number of samples
+            .reset_index(name='n_shots')              # -> column called n_shots
+        )
+        sc = plt.scatter(
+            probe_counts['alice_x'],
+            probe_counts['alice_p'],
+            c = probe_counts['n_shots'],
+            cmap = 'viridis',           # any perceptually uniform map works
+            norm = LogNorm(),           # try removing this if the colour contrast is too flat
+            s = 20,                     # marker size
+            edgecolors='none'           # cleaner look
+        )
+
+        plt.gca().set_aspect('equal')   # keep the phase-space axes square
+        plt.xlabel(r'Alice $x$  (SNU)')
+        plt.ylabel(r'Alice $p$  (SNU)')
+        plt.title('Probe-state distribution\n(colour = # shots)')
+        plt.colorbar(sc, label='samples per probe state')
+
+        plt.tight_layout()
+        plt.show()
+
     console.log("### Precomputing static arrays...")
     precomputation_results = precomputation(R, P, N, probe_states, d)
 
     # Unpack the precomputation results
-    u_mesh = precomputation_results["u"]
+    u = precomputation_results["u"]
     phi = precomputation_results["phi"]
     w_GL = precomputation_results["w_GL"]
     H_hermite = precomputation_results["H_hermite"]
     fft_basis = precomputation_results["fft_basis"]
-    Phi = precomputation_results["Phi"]
+    Phi = precomputation_results["Phi"] # Note that this is the polynomial design matrix, not the angular grid. (Phi =\= phi)
     p_idx = precomputation_results["p_idx"]
     q_idx = precomputation_results["q_idx"]
     fact = precomputation_results["fact"]
@@ -256,5 +402,54 @@ def main():
     inv_fact = precomputation_results["inv_fact"]
     pref_rho = precomputation_results["pref_rho"]
 
+    ######################### PREPROCESSING DONE #########################
+
+    console.log("### Processing each probe state (alpha_i)...")
+    # Extract shape of probe_states
+    A = len(probe_states)
+    rho_all  = np.empty((A, N+1, N+1), dtype=np.complex128)
+
+    # Put everything that is read-only into a single kwargs dict so that we
+    # forward just one argument instead of many.
+    common_kw = dict(
+        u_mesh    = u,
+        phi_mesh  = phi,
+        w_GL      = w_GL,
+        H_hermite = H_hermite,
+        pref_rho  = pref_rho,
+        N         = N
+    )
+
+    # TODO: Multiprocessing of this loop
+    for i, alpha in enumerate(probe_states):
+        _, rho_i = process_single_probe(i, alpha, df, **common_kw)
+        rho_all[i] = rho_i
+        console.log(f"  → finished {i+1}/{A}")
+
+        # Manually change i range to see different probe states
+        if plot and (i < 5):
+            mask = (
+                (df["alice_x"] == alpha.real) &
+                (df["alice_p"] == alpha.imag)
+            )
+            x_vals = df.loc[mask, "bob_x"]
+            p_vals = df.loc[mask, "bob_p"]
+
+            plt.figure(figsize=(6,6))
+            plt.scatter(x_vals, p_vals, s=5, alpha=0.7)
+            plt.plot(alpha.real, alpha.imag,
+                    marker='X', color='red', markersize=12)
+            plt.xlim(-5, 5)
+            plt.ylim(-5, 5)
+            plt.xlabel('Bob $x$ (SNU)')
+            plt.ylabel('Bob $p$ (SNU)')
+            plt.title(f'Probe #{i} — $\\alpha={alpha.real:.2f}{alpha.imag:+.2f}i$')
+            plt.gca().set_aspect('equal')
+            plt.grid(True, linestyle='--', alpha=0.7)  # Add a grid
+            plt.tight_layout()
+            plt.show()
+
+    console.log("### Finished processing all probe states.")
+    
 if __name__ == "__main__":
     main()
