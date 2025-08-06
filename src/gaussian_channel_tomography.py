@@ -2,12 +2,18 @@ import os
 import numpy as np
 import pandas as pd
 from numpy.polynomial.laguerre import laggauss
-from scipy.special import eval_hermite, factorial, gammaln
+from scipy.special import eval_laguerre, factorial, gammaln
 from rich.console import Console
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm  
 
 console = Console()
+
+def coherent_state_ground_truth_rho(alpha: complex, N: int) -> np.ndarray:
+    """Full |α⟩⟨α| truncated at Fock N."""
+    n = np.arange(N + 1)
+    coeff = np.exp(-abs(alpha)**2 / 2) * alpha**n / np.sqrt(factorial(n))
+    return np.outer(np.conjugate(coeff), coeff)          # (N+1, N+1)
 
 def load_qkd_data(file_path: str) -> dict:
     """
@@ -106,7 +112,8 @@ def precomputation(R: int, P: int, N: int, alphas: np.ndarray, d: int) -> dict:
     # 2.  Hermite table  H_{k,m}  with 0 ≤ k ≤ 2N
     # ------------------------------------------------------------------
     k_vals = np.arange(0, 2*N + 1, dtype=int)           # (2N+1,)
-    H = eval_hermite(k_vals[:, None], u_mesh[None, :] / 2.0)  # (2N+1, R)
+    # H = eval_hermite(k_vals[:, None], u_mesh[None, :] / 2.0)  # (2N+1, R)
+    H = eval_laguerre(k_vals[:, None], u_mesh[None, :])
 
     # ------------------------------------------------------------------
     # 3.  FFT basis   exp(-i k φ_n)
@@ -247,7 +254,8 @@ def _radial_contraction(Qk: np.ndarray,
                         H_hermite: np.ndarray,
                         w_GL: np.ndarray,
                         pref_rho: np.ndarray,
-                        N: int) -> np.ndarray:
+                        N: int,
+                        u_mesh: np.ndarray) -> np.ndarray:
     """
     Compute rho[m,n] for a single probe from its Q_k radial slices.
 
@@ -258,6 +266,7 @@ def _radial_contraction(Qk: np.ndarray,
     w_GL       : (R,)      – Gauss–Laguerre weights
     pref_rho   : (N+1,N+1) – ε_{mn} √m!√n! / (2 (m+n)!)
     N          : int       – Fock cutoff
+    u_mesh     : (R,)      – Gauss–Laguerre mesh points
     """
     k_max = N                               # range we really need
     # ------------------------------------------------------------
@@ -281,7 +290,8 @@ def _radial_contraction(Qk: np.ndarray,
         # But because each k uses a *single* ℓ = n-m shift, the cheaper way is:
         ell = k + N              # shift range -N…N → 0…2N
         if 0 <= ell <= 2*N:
-            I[ell] = np.dot(w_GL, Q_slice * H_hermite[ell])
+            # compensate the weight mismatch: multiply by e^{+u/2}
+            I[ell] += np.dot(w_GL, np.exp(u_mesh / 2.0) * Q_slice * H_hermite[ell])
 
     # ------------------------------------------------------------
     # Step 2 : map (m,n) to k = n-m and ℓ = m+n and multiply prefactor
@@ -321,10 +331,10 @@ def process_single_probe(idx: int,
                      phi_mesh)                                    # (R, P)
 
     # 3) angular FFT (only need k = 0 … N+1)
-    Qk = _angular_fft(Q, k_max=N+1)                               # (k_max+1, R)
+    Qk = 2*np.pi * _angular_fft(Q, k_max=N+1)                               # (k_max+1, R)
 
     # 4) radial contraction → rho_{mn}
-    rho_i = _radial_contraction(Qk, H_hermite, w_GL, pref_rho, N)
+    rho_i = _radial_contraction(Qk, H_hermite, w_GL, pref_rho, N, u_mesh)
 
     # 5) return the index and the computed density matrix. idx is needed for multiprocessing.
     return idx, rho_i
@@ -332,7 +342,7 @@ def process_single_probe(idx: int,
 def main():
     console.log("### Starting...")
     # Parameters
-    plot = False # Set to False to disable plotting
+    plot = True # Set to False to disable plotting
     R = 80   # Radial grid size
     P = 80   # Angular grid size
     N = 35  # Fock cutoff
@@ -352,20 +362,40 @@ def main():
     bob_p_raw = qkd_data['bob_p']
 
     console.log("### Extracting valid probe states...")
-    # Returns a pandas DataFrame with ["alice_x", "alice_p", "bob_x", "bob_p"].
-    df = extract_valid_probe_states(alice_x_raw, alice_p_raw, bob_x_raw, bob_p_raw, probe_state_instance_minimum)
     
-    # Determine the unique probe states, solely for passing to the function below. They will be iterated over
-    # more neatly later.
-    probe_states = (df["alice_x"] + 1j * df["alice_p"]).drop_duplicates().to_numpy()
+    probe_states_file = "data/probe_states.npz"
+    if os.path.exists(probe_states_file):
+        console.log(f"### Loading precomputed probe_states from {probe_states_file}...")
+
+        probe_states = np.load(probe_states_file)["probe_states"]
+        probe_counts = np.load(probe_states_file)["probe_counts"]
+        probe_counts = pd.DataFrame(probe_counts, columns=["alice_x", "alice_p", "n_shots"])
+
+        console.log("### probe_states loaded successfully.")
+
+    else:
+        console.log("### probe_states.npz not found. Extracting and saving probe_states...")
+
+        # Returns a pandas DataFrame with ["alice_x", "alice_p", "bob_x", "bob_p"].
+        df = extract_valid_probe_states(alice_x_raw, alice_p_raw, bob_x_raw, bob_p_raw, probe_state_instance_minimum)
+        probe_states = (df["alice_x"] + 1j * df["alice_p"]).drop_duplicates().to_numpy()
+        
+        # build a DataFrame of counts
+        probe_counts = (
+            df.groupby(['alice_x', 'alice_p'])
+                .size()
+                .reset_index(name='n_shots')
+        )
+
+        # save BOTH arrays
+        np.savez(probe_states_file,
+                    probe_states=probe_states,
+                    probe_counts=probe_counts.values)
+        console.log("### probe_states saved successfully.")
 
     if plot:
         console.log("### Plotting probe states...")
-        probe_counts = (
-            df.groupby(['alice_x', 'alice_p'])
-            .size()                                   # number of samples
-            .reset_index(name='n_shots')              # -> column called n_shots
-        )
+
         sc = plt.scatter(
             probe_counts['alice_x'],
             probe_counts['alice_p'],
@@ -402,54 +432,105 @@ def main():
     inv_fact = precomputation_results["inv_fact"]
     pref_rho = precomputation_results["pref_rho"]
 
+    console.log("### Preprocessing done. Ready to compute density matrices...")
+
     ######################### PREPROCESSING DONE #########################
 
-    console.log("### Processing each probe state (alpha_i)...")
     # Extract shape of probe_states
     A = len(probe_states)
-    rho_all  = np.empty((A, N+1, N+1), dtype=np.complex128)
 
-    # Put everything that is read-only into a single kwargs dict so that we
-    # forward just one argument instead of many.
-    common_kw = dict(
-        u_mesh    = u,
-        phi_mesh  = phi,
-        w_GL      = w_GL,
-        H_hermite = H_hermite,
-        pref_rho  = pref_rho,
-        N         = N
-    )
+    # Check if rho_all.npz already exists
+    rho_file_path = "data/rho_all.npz"
+    if os.path.exists(rho_file_path):
+        console.log(f"### Loading precomputed rho_all from {rho_file_path}...")
+        rho_all = np.load(rho_file_path)["rho_all"]
+        console.log("### rho_all loaded successfully.")
+    else:
+        console.log("### rho_all.npz not found. Proceeding with computation...")
 
-    # TODO: Multiprocessing of this loop
-    for i, alpha in enumerate(probe_states):
-        _, rho_i = process_single_probe(i, alpha, df, **common_kw)
-        rho_all[i] = rho_i
-        console.log(f"  → finished {i+1}/{A}")
+        console.log("### Processing each probe state (alpha_i)...")
+        # Extract shape of probe_states
 
-        # Manually change i range to see different probe states
-        if plot and (i < 5):
-            mask = (
-                (df["alice_x"] == alpha.real) &
-                (df["alice_p"] == alpha.imag)
-            )
-            x_vals = df.loc[mask, "bob_x"]
-            p_vals = df.loc[mask, "bob_p"]
+        rho_all  = np.empty((A, N+1, N+1), dtype=np.complex128)
 
-            plt.figure(figsize=(6,6))
-            plt.scatter(x_vals, p_vals, s=5, alpha=0.7)
-            plt.plot(alpha.real, alpha.imag,
-                    marker='X', color='red', markersize=12)
-            plt.xlim(-5, 5)
-            plt.ylim(-5, 5)
-            plt.xlabel('Bob $x$ (SNU)')
-            plt.ylabel('Bob $p$ (SNU)')
-            plt.title(f'Probe #{i} — $\\alpha={alpha.real:.2f}{alpha.imag:+.2f}i$')
-            plt.gca().set_aspect('equal')
-            plt.grid(True, linestyle='--', alpha=0.7)  # Add a grid
+        # Put everything that is read-only into a single kwargs dict so that we
+        # forward just one argument instead of many.
+        common_kw = dict(
+            u_mesh    = u,
+            phi_mesh  = phi,
+            w_GL      = w_GL,
+            H_hermite = H_hermite,
+            pref_rho  = pref_rho,
+            N         = N
+        )
+
+        # TODO: Multiprocessing of this loop
+        for i, alpha in enumerate(probe_states):
+            _, rho_i = process_single_probe(i, alpha, df, **common_kw)
+            rho_all[i] = rho_i
+
+            if i % 10 == 0:
+                console.log(f"  → finished {i+1}/{A}")
+
+            # Manually change i range to see different probe states
+            if plot and (i < 5):
+                mask = (
+                    (df["alice_x"] == alpha.real) &
+                    (df["alice_p"] == alpha.imag)
+                )
+                x_vals = df.loc[mask, "bob_x"]
+                p_vals = df.loc[mask, "bob_p"]
+
+                plt.figure(figsize=(6,6))
+                plt.scatter(x_vals, p_vals, s=5, alpha=0.7)
+                plt.plot(alpha.real, alpha.imag, marker='X', color='red', markersize=12, label = "input probe state")
+                # Add another marker for the expected output
+                plt.plot(T * alpha.real, T * alpha.imag, marker='X', color='blue', markersize=12, label = "Expected output")
+                plt.xlim(-5, 5)
+                plt.ylim(-5, 5)
+                plt.xlabel('Bob $x$ (SNU)')
+                plt.ylabel('Bob $p$ (SNU)')
+                plt.title(f'Probe #{i} — $\\alpha={alpha.real:.2f}{alpha.imag:+.2f}i$')
+                plt.gca().set_aspect('equal')
+                plt.grid(True, linestyle='--', alpha=0.7)  # Add a grid
+                plt.tight_layout()
+                plt.legend()
+                plt.show()
+
+        console.log("### Finished processing all probe states.")
+
+        # Save rho_all to an npz file
+        console.log("### Saving rho_all to file...")
+        np.savez("data/rho_all.npz", rho_all=rho_all)
+        console.log("### rho_all saved successfully.")
+
+    if plot:
+        console.log("### Visualising rho_mn for the first 5 probe states...")
+        for i in range(5):
+            rho_i = rho_all[i]
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+            # Left plot: Reconstructed rho_i
+            im1 = axes[0].imshow(np.abs(rho_i), origin='lower', cmap='viridis', interpolation='none')
+            trace_reconstructed = np.trace(rho_i)
+            axes[0].set_title(f'Reconstructed $\\rho_{{mn}}$ — Probe #{i}\n$\\alpha_in={probe_states[i].real:.2f}{probe_states[i].imag:+.2f}i$, Trace={trace_reconstructed:.4f}')
+            axes[0].set_xlabel(r'$n$')
+            axes[0].set_ylabel(r'$m$')
+            fig.colorbar(im1, ax=axes[0], label=r'$|\rho_{mn}|$')
+
+            # Right plot: Expected output rho
+            expected_alpha = probe_states[i] * T
+            rho_expected = coherent_state_ground_truth_rho(expected_alpha, N)
+            im3 = axes[1].imshow(np.abs(rho_expected), origin='lower', cmap='viridis', interpolation='none')
+            trace_expected = np.trace(rho_expected)
+            axes[1].set_title(f'Expected $\\rho_{{mn}}$ — Probe #{i}\n$\\alpha={expected_alpha.real:.2f}{expected_alpha.imag:+.2f}i$, Trace={trace_expected:.4f}')
+            axes[1].set_xlabel(r'$n$')
+            axes[1].set_ylabel(r'$m$')
+            fig.colorbar(im3, ax=axes[1], label=r'$|\rho_{mn}|$')
+
             plt.tight_layout()
             plt.show()
 
-    console.log("### Finished processing all probe states.")
-    
 if __name__ == "__main__":
     main()

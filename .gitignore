@@ -3,6 +3,8 @@ src/data_dir.py
 temp.py
 **.ipynb
 data/
+.vscode/
+src/old_notebooks/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
