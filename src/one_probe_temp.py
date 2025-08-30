@@ -106,7 +106,6 @@ def load_probe_state_data(
 
     return alpha_0, x_vals, p_vals, d['T']
 
-
 if __name__ == "__main__":
     plot = True
     
