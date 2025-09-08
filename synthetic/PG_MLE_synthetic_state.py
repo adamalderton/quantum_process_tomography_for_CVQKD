@@ -492,7 +492,7 @@ def run_default_tests(
 	verbose: bool = True,
 	make_panel_figs: bool = False,
 	summary_filename: str = "pg_test_summary.png",
-	init_method: str = "alpha_bar",
+	init_method: str = "maximally_mixed",
 ) -> Dict[str, object]:
 	"""PG analogue of the RRR batch test (coherent grid + number states)."""
 	rng = np.random.default_rng(seed)
